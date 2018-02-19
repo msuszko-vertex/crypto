@@ -575,6 +575,41 @@ func (pipe *pipedConn) Close() {
 	pipe.downstream.transport.Close()
 }
 
+func (pipe *pipedConn) pipeAuthSkipBanner(packet []byte) (bool, error) {
+	// pipe to auth succ if not a authreq
+	// typically, authinfo see RFC 4256
+	// TODO support hook this msg
+	err := pipe.upstream.transport.writePacket(packet)
+	if err != nil {
+		return false, err
+	}
+
+	for {
+		packet, err := pipe.upstream.transport.readPacket()
+		if err != nil {
+			return false, err
+		}
+
+		msgType := packet[0]
+
+		if err = pipe.downstream.transport.writePacket(packet); err != nil {
+			return false, err
+		}
+
+		switch msgType {
+		case msgUserAuthSuccess:
+			return true, nil
+		case msgUserAuthBanner:
+			// should read another packet from upstream
+			continue
+		case msgUserAuthFailure:
+		default:
+		}
+
+		return false, nil
+	}
+}
+
 func (pipe *pipedConn) pipeAuth(initUserAuthMsg *userAuthRequestMsg) error {
 	err := pipe.upstream.sendAuthReq()
 	if err != nil {
@@ -593,61 +628,42 @@ func (pipe *pipedConn) pipeAuth(initUserAuthMsg *userAuthRequestMsg) error {
 
 		// nil for ignore
 		if userAuthMsg != nil {
-			err = pipe.upstream.transport.writePacket(Marshal(userAuthMsg))
+			// send a mapped auth msg
+			succ, err := pipe.pipeAuthSkipBanner(Marshal(userAuthMsg))
+
 			if err != nil {
 				return err
 			}
 
-			packet, err := pipe.upstream.transport.readPacket()
-			if err != nil {
-				return err
-			}
-
-			success := packet[0] == msgUserAuthSuccess || packet[0] == msgUserAuthBanner
-
-			if err = pipe.downstream.transport.writePacket(packet); err != nil {
-				return err
-			}
-
-			if success {
+			if succ {
 				return nil
 			}
+
 		}
 
 		var packet []byte
 
 		for {
 
+			// find next msg which need to be hooked
 			if packet, err = pipe.downstream.transport.readPacket(); err != nil {
 				return err
 			}
 
 			// we can only handle auth req at the moment
 			if packet[0] == msgUserAuthRequest {
+				// should hook, deal with it
 				break
 			}
 
-			// pipe to auth succ if not a authreq
-			// typically, authinfo see RFC 4256
-			// TODO support hook this msg
-			err = pipe.upstream.transport.writePacket(packet)
+			// pipe other auth msg
+			succ, err := pipe.pipeAuthSkipBanner(packet)
+
 			if err != nil {
 				return err
 			}
 
-			// TODO clean up dup code
-			packet, err := pipe.upstream.transport.readPacket()
-			if err != nil {
-				return err
-			}
-
-			success := packet[0] == msgUserAuthSuccess || packet[0] == msgUserAuthBanner
-
-			if err = pipe.downstream.transport.writePacket(packet); err != nil {
-				return err
-			}
-
-			if success {
+			if succ {
 				return nil
 			}
 		}
@@ -659,7 +675,6 @@ func (pipe *pipedConn) pipeAuth(initUserAuthMsg *userAuthRequestMsg) error {
 		}
 
 		userAuthMsg = &userAuthReq
-
 	}
 }
 
