@@ -71,7 +71,7 @@ func ExampleNewSSHPiperConn() {
 
 // }}}
 
-func dialPiper(piper *PiperConfig) (net.Conn, error) {
+func dialPiper(piper *PiperConfig, afterConn func(*PiperConn), t *testing.T) (net.Conn, error) {
 	c, s, err := netPipe()
 	if err != nil {
 		return nil, err
@@ -86,8 +86,12 @@ func dialPiper(piper *PiperConfig) (net.Conn, error) {
 		p, err := NewSSHPiperConn(s, piper)
 
 		if err != nil {
-			fmt.Println(err)
+			t.Errorf("failed to create piper conn %v", err)
 			return
+		}
+
+		if afterConn != nil {
+			afterConn(p)
 		}
 
 		p.Wait()
@@ -128,7 +132,7 @@ func TestPiperFindUpstreamCallback(t *testing.T) {
 				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
 			}, err
 		},
-	})
+	}, nil, t)
 
 	if err != nil {
 		t.Fatalf("connect dial to piper: %v", err)
@@ -173,7 +177,7 @@ func TestPiperFindUpstreamWithUserCallback(t *testing.T) {
 				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
 			}, err
 		},
-	})
+	}, nil, t)
 
 	if err != nil {
 		t.Fatalf("connect dial to piper: %v", err)
@@ -222,7 +226,7 @@ func TestPiperMapPublicKey(t *testing.T) {
 				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
 			}, err
 		},
-	})
+	}, nil, t)
 
 	if err != nil {
 		t.Fatalf("connect dial to piper: %v", err)
@@ -285,7 +289,7 @@ func TestPiperMapPublicKeyToPassword(t *testing.T) {
 				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
 			}, err
 		},
-	})
+	}, nil, t)
 
 	if err != nil {
 		t.Fatalf("connect dial to piper: %v", err)
@@ -338,7 +342,7 @@ func TestPiperPasswordToMapPublicKey(t *testing.T) {
 				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
 			}, err
 		},
-	})
+	}, nil, t)
 
 	if err != nil {
 		t.Fatalf("connect dial to piper: %v", err)
@@ -392,7 +396,7 @@ func TestPiperServerWithBanner(t *testing.T) {
 				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
 			}, err
 		},
-	})
+	}, nil, t)
 
 	if err != nil {
 		t.Fatalf("connect dial to piper: %v", err)
@@ -472,7 +476,7 @@ func TestPiperUsernameNotChangedWithinSession(t *testing.T) {
 				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
 			}, err
 		},
-	})
+	}, nil, t)
 
 	if err != nil {
 		t.Fatalf("connect dial to piper: %v", err)
@@ -522,7 +526,7 @@ func TestPiperAdditionalChallenge(t *testing.T) {
 				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
 			}, err
 		},
-	})
+	}, nil, t)
 
 	if err != nil {
 		t.Fatalf("connect dial to piper: %v", err)
@@ -588,6 +592,141 @@ func dialUpstream(handler serverType, upstream *ServerConfig, t *testing.T) (net
 	return c, nil
 }
 
+func TestPiperConnMeta(t *testing.T) {
+
+	wait := make(chan int)
+
+	c, err := dialPiper(&PiperConfig{
+		FindUpstream: func(conn ConnMetadata) (net.Conn, *AuthPipe, error) {
+			s, err := dialUpstream(simpleEchoHandler, &ServerConfig{NoClientAuth: true}, t)
+			return s, &AuthPipe{
+				User: "up",
+				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
+			}, err
+		},
+	}, func(p *PiperConn) {
+
+		if p.DownstreamConnMeta().User() != "down" {
+			t.Errorf("different downstream user")
+		}
+
+		if p.UpstreamConnMeta().User() != "up" {
+			t.Errorf("different upstream user")
+		}
+
+		wait <- 0
+	}, t)
+
+	_, _, _, err = NewClientConn(c, "", &ClientConfig{
+		User:            "down",
+		Auth:            []AuthMethod{new(noneAuth)},
+		HostKeyCallback: InsecureIgnoreHostKey(),
+	})
+
+	if err != nil {
+		t.Fatalf("can connect to piper %v", err)
+	}
+
+	<-wait
+}
+
+func TestPiperConnMsgHook(t *testing.T) {
+
+	wait := make(chan int)
+
+	c, err := dialPiper(&PiperConfig{
+		FindUpstream: func(conn ConnMetadata) (net.Conn, *AuthPipe, error) {
+			s, err := dialUpstream(simpleEchoHandler, &ServerConfig{NoClientAuth: true}, t)
+			return s, &AuthPipe{
+				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
+			}, err
+		},
+	}, func(p *PiperConn) {
+
+		p.HookDownstreamMsg = func(conn ConnMetadata, msg []byte) ([]byte, error) {
+			if msg[0] == msgChannelData {
+				m := channelDataMsg{}
+				Unmarshal(msg, &m)
+				if string(m.Rest) != "123456" {
+					t.Errorf("msg not equal")
+				}
+
+				m.Length = 3
+				m.Rest = []byte("654")
+
+				return Marshal(m), nil
+			}
+
+			return msg, nil
+		}
+
+		p.HookUpstreamMsg = func(conn ConnMetadata, msg []byte) ([]byte, error) {
+			if msg[0] == msgChannelData {
+				m := channelDataMsg{}
+				Unmarshal(msg, &m)
+				if string(m.Rest) != "654" {
+					t.Errorf("msg not equal")
+				}
+
+				m.Length = 7
+				m.Rest = []byte("abcdefg")
+
+				return Marshal(m), nil
+			}
+
+			return msg, nil
+		}
+
+		wait <- 0
+	}, t)
+
+	sshc, chans, reqs, err := NewClientConn(c, "", &ClientConfig{
+		User:            "test",
+		Auth:            []AuthMethod{new(noneAuth)},
+		HostKeyCallback: InsecureIgnoreHostKey(),
+	})
+
+	if err != nil {
+		t.Fatalf("can connect to piper %v", err)
+	}
+	<-wait
+
+	conn := NewClient(sshc, chans, reqs)
+	defer conn.Close()
+
+	session, err := conn.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe failed: %v", err)
+	}
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe failed: %v", err)
+	}
+
+	data := []byte(`123456`)
+	_, err = stdin.Write(data)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	stdin.Close()
+
+	res, err := ioutil.ReadAll(stdout)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+
+	if !bytes.Equal([]byte(`abcdefg`), res) {
+		t.Fatalf("Read differed from write, wrote: %v, read: %v", data, res)
+	}
+
+}
+
 func TestPiperPipeData(t *testing.T) {
 
 	c, err := dialPiper(&PiperConfig{
@@ -597,7 +736,7 @@ func TestPiperPipeData(t *testing.T) {
 				UpstreamHostKeyCallback: InsecureIgnoreHostKey(),
 			}, err
 		},
-	})
+	}, nil, t)
 
 	if err != nil {
 		t.Fatalf("connect dial to piper: %v", err)

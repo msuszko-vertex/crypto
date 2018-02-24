@@ -251,6 +251,7 @@ func NewSSHPiperConn(conn net.Conn, piper *PiperConfig) (pipe *PiperConn, err er
 			u.Close()
 		}
 	}()
+	u.user = mappedUser
 
 	p := &pipedConn{
 		upstream:   u,
@@ -759,11 +760,9 @@ func (c *connection) clientHandshakeNoAuth(dialAddress string, config *ClientCon
 
 	if err := c.transport.waitSession(); err != nil {
 		return err
-
 	}
 
 	c.sessionID = c.transport.getSessionID()
-
 	return nil
 }
 
