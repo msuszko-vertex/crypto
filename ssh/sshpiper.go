@@ -595,7 +595,7 @@ func piping(dst, src packetConn, hooker func(msg []byte) ([]byte, error)) error 
 }
 
 func (pipe *pipedConn) loop() error {
-	c := make(chan error)
+	c := make(chan error, 2)
 
 	go func() {
 		c <- piping(pipe.upstream.transport, pipe.downstream.transport, pipe.hookDownstreamMsg)
